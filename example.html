@@ -1,0 +1,286 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Document</title>
+    <style>
+      .container {
+        display: flex;
+        justify-content: center;
+      }
+
+      .container canvas {
+        margin: 0 20px;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="container">
+      <!-- 展示原图片 -->
+      <canvas id="origin"></canvas>
+      <!-- 展示编码，解码过程的图片 -->
+      <canvas id="target"></canvas>
+    </div>
+
+    <script>
+      // 使用Promise加载图片
+      function loadImg(src) {
+        return new Promise((resolve, reject) => {
+          const img = new Image();
+          img.onload = function () {
+            resolve(this);
+          };
+          img.onerror = function (e) {
+            reject(e);
+          };
+          img.src = src;
+        });
+      }
+
+      function RGBA2YUV(R, G, B) {
+        const Y = 0.299 * R + 0.587 * G + 0.114 * B;
+        const U = -0.169 * R - 0.331 * G + 0.5 * B + 128;
+        const V = 0.5 * R - 0.419 * G - 0.081 * B + 128;
+        return [Y, U, V];
+      }
+
+      function YUV2RBG(Y, U, V) {
+        const R = Y + 1.403 * (V - 128); //
+        const G = Y - 0.343 * (U - 128) - 0.714 * (V - 128);
+        const B = Y + 1.77 * (U - 128);
+        return [R, G, B, 255];
+      }
+
+      // 定义离散余弦变换函数
+      const Hash = {};
+
+      const getCoff = (index, length) => {
+        if (!Hash[length]) {
+          let coff = [];
+          coff[0] = 1 / Math.sqrt(length);
+          for (let i = 1; i < length; i++) {
+            coff[i] = Math.sqrt(2) / Math.sqrt(length);
+          }
+          Hash[length] = coff;
+        }
+        return Hash[length][index];
+      };
+
+      const DCT = (signal) => {
+        const L = signal.length;
+        let tmp = Array(L * L).fill(0);
+        let res = Array(L)
+          .fill("")
+          .map(() => []);
+        for (let i = 0; i < L; i++) {
+          for (let j = 0; j < L; j++) {
+            for (let x = 0; x < L; x++) {
+              tmp[i * L + j] +=
+                getCoff(j, L) *
+                signal[i][x] *
+                Math.cos(((2 * x + 1) * Math.PI * j) / 2 / L);
+            }
+          }
+        }
+        for (let i = 0; i < L; i++) {
+          for (let j = 0; j < L; j++) {
+            for (let x = 0; x < L; x++) {
+              res[i][j] =
+                (res[i][j] || 0) +
+                getCoff(i, L) *
+                  tmp[x * L + j] *
+                  Math.cos(((2 * x + 1) * Math.PI * i) / 2 / L);
+            }
+          }
+        }
+        return res;
+      };
+
+      const IDCT = (signal) => {
+        const L = signal.length;
+        let tmp = Array(L * L).fill(0);
+        let res = Array(L)
+          .fill("")
+          .map(() => []);
+        for (let i = 0; i < L; i++) {
+          for (let j = 0; j < L; j++) {
+            for (let x = 0; x < L; x++) {
+              tmp[i * L + j] +=
+                getCoff(x, L) *
+                signal[i][x] *
+                Math.cos(((2 * j + 1) * x * Math.PI) / 2 / L);
+            }
+          }
+        }
+        for (let i = 0; i < L; i++) {
+          for (let j = 0; j < L; j++) {
+            for (let x = 0; x < L; x++) {
+              res[i][j] =
+                (res[i][j] || 0) +
+                getCoff(x, L) *
+                  tmp[x * L + j] *
+                  Math.cos(((2 * i + 1) * x * Math.PI) / 2 / L);
+            }
+          }
+        }
+        return res;
+      };
+
+      const Yquantify = [
+        [16, 11, 10, 16, 24, 40, 51, 61],
+        [12, 12, 14, 19, 26, 58, 60, 55],
+        [14, 13, 16, 24, 40, 57, 69, 56],
+        [14, 17, 22, 29, 51, 87, 80, 62],
+        [18, 22, 37, 56, 68, 109, 103, 77],
+        [24, 35, 55, 64, 81, 104, 113, 92],
+        [49, 64, 78, 87, 103, 121, 120, 101],
+        [72, 92, 95, 98, 112, 100, 103, 99],
+      ];
+
+      const UVquantify = [
+        [17, 18, 24, 47, 99, 99, 99, 99],
+        [18, 21, 26, 66, 99, 99, 99, 99],
+        [24, 26, 56, 99, 99, 99, 99, 99],
+        [47, 66, 99, 99, 99, 99, 99, 99],
+        [99, 99, 99, 99, 99, 99, 99, 99],
+        [99, 99, 99, 99, 99, 99, 99, 99],
+        [99, 99, 99, 99, 99, 99, 99, 99],
+        [99, 99, 99, 99, 99, 99, 99, 99],
+      ];
+
+      (async () => {
+        const img = await loadImg("/images.jpeg");
+
+        const origin = document.getElementById("origin");
+        const target = document.getElementById("target");
+
+        const originCtx = origin.getContext("2d");
+        const targetCtx = target.getContext("2d");
+
+        // 因为测试用例的图片是300 * 224, 宽度不是8的倍数， 设置成8的倍数好计算
+        const [width, height] = [
+          img.width - (img.width % 8),
+          img.height - (img.height % 8),
+        ];
+
+        origin.width = width;
+        origin.height = height;
+        target.width = width;
+        target.height = height;
+
+        // 将图片绘制在origin
+        originCtx.drawImage(img, 0, 0, width, height);
+        console.log(width, height);
+        const imgPixel = originCtx.getImageData(0, 0, width, height);
+
+        // 因为ImageData是rgba的数据结合，每4位表示一个像素点的rgba值
+        const fullRgba = Array.from(imgPixel.data);
+        const rgba = [];
+        for (let i = 0; i < fullRgba.length / 4; i++) {
+          const [r, g, b, a] = fullRgba.slice(i * 4, i * 4 + 4);
+          const [y, u, v] = RGBA2YUV(r, g, b);
+          rgba.push({ i, r, g, b, a, y, u, v });
+        }
+
+        // 将图片的像素切分成8*8像素的矩阵
+        const pixel8 = [];
+        for (let i = 0; i < height / 8; i++) {
+          for (let j = 0; j < width / 8; j++) {
+            const s = Array.from({ length: 8 }).map((_, index) => {
+              return rgba.slice(
+                i * width * 8 + j * 8 + index * width,
+                i * width * 8 + j * 8 + index * width + 8
+              );
+            });
+            pixel8.push(s);
+          }
+        }
+
+        const encodeDecode = pixel8.map((item) => {
+          // 编码 - 离散余弦变换
+          // 将影像中的每个成分（Y, U, V）生成三个区域，每一个区域再划分成如瓷砖般排列的一个个的8×8子区域，每一子区域使用二维的离散余弦变换（DCT）转换到频率空间。
+          // 推移128，使其范围变为 -128~127
+          const YS = item.map((r) => r.map((c) => c.y - 128));
+          const US = item.map((r) => r.map((c) => c.u - 128));
+          const VS = item.map((r) => r.map((c) => c.v - 128));
+
+          // 且接着使用离散余弦变换，和舍位取最接近的整数
+          const YSDCT = DCT(YS).map(
+            (v, i) => v.map((q, j) => Math.round(q / Yquantify[i][j])) // 使用这个量化矩阵Yquantify与前面所得到的DCT系数矩阵逐项相除
+          );
+          const USDCT = DCT(US).map(
+            (v, i) => v.map((q, j) => Math.round(q / UVquantify[i][j])) // 使用这个量化矩阵UVquantify与前面所得到的DCT系数矩阵逐项相除
+          );
+          const VSDCT = DCT(VS).map(
+            (v, i) => v.map((q, j) => Math.round(q / UVquantify[i][j])) // 使用这个量化矩阵UVquantify与前面所得到的DCT系数矩阵逐项相除
+          );
+
+          // 因为这里主要展示的是编码 解码的过程，所以省略掉 熵编码的过程，直接进行解码
+
+          // 解码
+          // 取DCT系数矩阵，且以前面的量化矩阵乘以它，再使用反向DCT得到一个有数值的影像，最后对每一项加上128
+          // 主要的损失就发生在这里，在进行反向DCT的时候矩阵中数值越大，差异就越大，差异主要来自反向DCT的过程。
+          const YSIDCT = IDCT(
+            YSDCT.map((v, i) => v.map((q, j) => q * Yquantify[i][j]))
+          ).map((r) => r.map((c) => c + 128));
+          const USIDCT = IDCT(
+            USDCT.map((v, i) => v.map((q, j) => q * UVquantify[i][j]))
+          ).map((r) => r.map((c) => c + 128));
+          const VISDCT = IDCT(
+            VSDCT.map((v, i) => v.map((q, j) => q * UVquantify[i][j]))
+          ).map((r) => r.map((c) => c + 128));
+
+          return item.map((r, i) =>
+            r.map((c, j) => ({
+              ...c,
+              _y: YSIDCT[i][j],
+              _u: USIDCT[i][j],
+              _v: VISDCT[i][j],
+            }))
+          );
+        });
+
+        // 将8*8的矩阵转化回像素
+        const decode = [];
+        for (let i = 0; i < height / 8; i++) {
+          const row8 = encodeDecode.slice(
+            (i * width) / 8,
+            ((i + 1) * width) / 8
+          );
+          const s = Array.from({ length: 8 })
+            .map((c, i) =>
+              row8.map((a) => a[i]).reduce((s, a) => [...s, ...a], [])
+            )
+            .reduce((s, a) => [...s, ...a], []);
+          decode.push(...s);
+        }
+
+        const targetPixel = decode
+          .map((i) => {
+            const [r, g, b] = YUV2RBG(i._y, i._u, i._v);
+            return {
+              ...i,
+              _r: r,
+              _g: g,
+              _b: b,
+            };
+          })
+          .map((b) => [b._r, b._g, b._b, 255])
+          .flat(1);
+
+        // 将转化后的图像绘制在canvas上
+        targetCtx.putImageData(
+          new ImageData(Uint8ClampedArray.from(targetPixel), width, height),
+          0,
+          0,
+          0,
+          0,
+          width,
+          height
+        );
+      })();
+    </script>
+  </body>
+</html>
